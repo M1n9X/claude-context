@@ -2,7 +2,7 @@
 
 ## Summary
 
-Scope establishes a need to deliver a Supabase-backed storage path with Jina embeddings that matches current Milvus/OpenAI behavior across CLI, MCP server, VS Code, and Chrome. This document picks a technical strategy, documents alternatives, and identifies the research, dependencies, and gates required before planning.
+Scope establishes a need to deliver a Supabase-backed storage path with Jina embeddings that matches current Milvus/OpenAI behavior across CLI, MCP server, VS Code, and Chrome. This document focuses on a CLI-first rollout, documents alternatives, and identifies the research, dependencies, and gates required before planning.
 
 ## Solution Guardrails & Assumptions
 
@@ -10,7 +10,23 @@ Scope establishes a need to deliver a Supabase-backed storage path with Jina emb
 - Customers manage their own Supabase projects; we handle schema provisioning, migrations, and validation of required extensions (`pgvector`, optionally `pg_trgm`).
 - Shipping dense-only search is acceptable if hybrid parity is documented and scheduled (NC-1 default).
 - Environment secrets flow through existing secure stores per surface (Node env vars, VS Code SecretStorage, Chrome storage + OS keychain). Provide a compliant relay or read-only path when service keys cannot live client-side (supports scope A3).
-- Jina’s `jina-embeddings-v2-base-code` exposes 768–1024 dimensions over REST; adapter must detect dimension at runtime.
+- Jina’s `jina-code-embeddings-1.5b` model (via `POST /v1/embeddings`) is the default; adapter must detect output dimensions and task types at runtime.
+
+### Platform Tiers & Fallback (Evidence)
+
+- Free-tier (Nano compute) provides shared CPU, ≈0.5 GB RAM, ~500 MB recommended database size, baseline ≈250 IOPS, and 60 direct connections; exceeding ~500 MB pushes projects into read-only mode.[^supabase-compute][^supabase-free-size]
+- Data durability: Free tier lacks downloadable backups and PITR; operational guidance must enforce manual exports before storing critical data.[^supabase-backup]
+- Extension availability: `pgvector` is managed via the Supabase `extensions` schema across tiers; migrations must verify presence and guide enablement steps.[^supabase-pgvector]
+- Fallback: When limits or policy prevent Supabase adoption, recommend the Docker-based Postgres + pgvector deployment that reuses the same schema and migrations (planned in execution roadmap).
+
+### Free-tier Capability Evaluation
+
+- **Resource ceilings**: 60 direct connections (200 via pooler), shared CPU, and baseline ~250 IOPS require conservative pooling and sequential CLI-first indexing runs; parallel chunk workers must respect these caps.[^supabase-compute]
+- **Storage window**: Projects enter read-only at ~500 MB of database storage; CLI must surface remaining budget and trigger local fallback workflows before writes fail.[^supabase-free-size]
+- **Durability gap**: No downloadable backups or PITR on Free tier; operational docs must mandate manual exports before risky operations.[^supabase-backup]
+- **Extension checks**: Provisioning flow verifies `pgvector` availability and supplies enablement SQL when absent; failure redirects users to local fallback.[^supabase-pgvector]
+- **Support stance**: Paid Supabase plans are out of scope; if benchmarks or user limits fail, the product pivots to local Postgres/pgvector rather than recommending an upgrade.
+- **Conclusion**: For repos that keep database size <500 MB and run sequential CLI-first indexing, Supabase Free tier is viable; larger or bursty workloads must switch to the local fallback.
 
 ## Options Considered
 
@@ -26,19 +42,22 @@ Direct SQL access aligns with goals of portability (self-hosted Postgres later),
 
 ## Research Agenda (from Scope / New)
 
-1. **Hybrid search feasibility (NC-1)**: Benchmark pgvector + pg_trgm blend, cost vs. dense-only, and tuning requirements.
-2. **Supabase plan requirements (NC-2)**: Measure Free vs. Pro tier indexing throughput, extension availability, connection caps.
-3. **Usage telemetry for cost alerts (NC-3)**: Identify APIs or logs from Supabase and Jina for real-time usage.
-4. **Browser credential relay latency**: Quantify overhead when VS Code/Chrome rely on relay writes; confirm <500 ms p95 (validates A3).
+| RA ID | Question | Key Activities | Deliverable | Dependencies |
+|-------|----------|----------------|-------------|--------------|
+| RA1 | Can dense + lexical hybrid search meet relevance targets on Supabase? (NC-1) | Evaluate pgvector + pg_trgm viability, tunable weights, storage overhead. | Decision memo on launch scope + backlog item for hybrid follow-up. | Access to Supabase test projects. |
+| RA2 | Can Supabase Free-tier sustain target workloads before fallback is required? (NC-2) | Measure Free-tier throughput, connection/extension limits, read-only triggers; define fallback thresholds. | Supportability checklist + signals that prompt local fallback messaging. | RA1 data; Free-tier benchmarking harness. |
+| RA3 | How do we document the deferred telemetry scope? (NC-3) | Capture usage-display requirements, list deferred alerting scenarios, and flag follow-up owners. | Telemetry deferral memo feeding backlog. | Product + Support alignment. |
+| RA4 | What latency hit do relays introduce for browser clients? (supports A3) | Prototype relay interactions, capture p95 under typical loads. | Report with thresholds + relay fallback guidance. | Platform relay infrastructure. |
+| RA5 | When Supabase is not viable, how quickly can teams spin up local Postgres/pgvector? | Validate Docker-based reference deployment aligned with schema/migrations. | Deployment playbook feeding US2 fallback messaging + LP-T6 docs. | RA2 outputs. |
 
 ## Architecture Overview
 
 ### Components
 
 1. **Embedding Service Layer (`JinaEmbedding`)**
-   - Extends existing embedding abstraction.
-   - Handles batching (32 items default), retry/backoff for 429/5xx, detects vector dimension during warm-up.
-   - Emits usage estimates for cost transparency (feeds SC-4).
+   - Extends existing embedding abstraction and defaults to the `jina-code-embeddings-1.5b` model (`POST /v1/embeddings`).
+   - Handles batching (32 items default), retry/backoff for 429/5xx, detects vector dimension during warm-up, and supports task flags (e.g., `nl2code.query`, `code2code.passage`).
+   - Tracks token usage locally for UX messaging (no telemetry streaming in this release).
 
 2. **Vector Storage Layer (`PgVectorDatabase`)**
    - Node contexts: `pg` pool with SSL, statement timeouts, connection retries.
@@ -50,10 +69,10 @@ Direct SQL access aligns with goals of portability (self-hosted Postgres later),
    - Extend config loaders to accept Supabase credentials (URL, service role, anon key) and embedding provider choice.
    - Feature flag toggles between Milvus/OpenAI and Supabase/Jina until migration complete.
 
-4. **Health & Observability**
-   - CLI/MCP run `SELECT 1`, verify `pgvector` presence, and check row counts.
+4. **Health Checks & Observability**
+   - CLI runs `SELECT 1`, verifies `pgvector` presence, checks row counts, and surfaces headroom guidance.
    - Embedding health ping hits Jina with minimal payload to confirm credentials.
-   - Clients emit telemetry for indexing progress, latency, and provider usage (opt-in).
+   - No remote telemetry streaming in this release; progress is kept local to the CLI.
 
 ### Data Model Snapshot
 
@@ -64,6 +83,7 @@ Direct SQL access aligns with goals of portability (self-hosted Postgres later),
 | `settings_global` | `repo_id UUID`, `provider TEXT`, `dimension INT`, `migration_version INT` | Stores migration metadata and defaults. |
 
 Indexes:
+
 - `btree(relative_path)` for path filters.
 - `GIN (lexeme)` when lexical search enabled.
 - `btree(metadata->>'language')` for language-specific filters (optional).
@@ -77,7 +97,7 @@ Indexes:
 2. **Indexing**
    - Chunker produces documents; `JinaEmbedding` batches requests.
    - `PgVectorDatabase` writes in transactions with `ON CONFLICT` upserts.
-   - Progress events emitted to clients; usage estimates updated.
+   - CLI tracks progress locally and surfaces remaining headroom guidance.
 3. **Search**
    - Query text embedded with `retrieval.query`.
    - SQL: `SELECT ..., embedding <=> $1 AS distance FROM code_chunks ... ORDER BY distance ASC LIMIT k`.
@@ -91,23 +111,23 @@ Indexes:
 - **Simplicity Gate**: ≤3 new modules introduced (`JinaEmbedding`, `PgVectorDatabase`, migration runner). _Status_: Pass; no extra frameworks.
 - **Anti-Speculation Gate**: No migration wizard or advanced cost alerts in architecture scope; documented as future work. _Status_: Pass.
 - **Security Gate**: Credential storage for browser clients requires relay path or secret storage per platform; pending security review (owner: Security, due: before Phase 1 plan).
-- **Performance Gate**: Need benchmark harness proving search latency within SC-3 tolerance and indexing throughput acceptable on Free + Pro tiers (dependency on Research item #2).
+- **Performance Gate**: Need benchmark harness proving search latency within SC-3 tolerance and indexing throughput acceptable on the Supabase Free tier (dependency on RA2).
 
 ## Risks & Mitigations
 
 | Risk ID | Description | Impact | Mitigation | Owner | Decision By |
 |---------|-------------|--------|------------|-------|-------------|
-| R1 | Supabase Free tier throttling stalls indexing mid-process. | Medium | Detect limits upfront, throttle concurrency, recommend Pro tier in UI. | Platform Eng | Beta exit |
+| R1 | Supabase Free tier throttling stalls indexing mid-process. | Medium | Detect limits upfront, throttle concurrency, and guide users to the throttled mode or local fallback. | Platform Eng | Beta exit |
 | R2 | Jina model dimension change requires migration. | High | Detect dimension at runtime, version tables, supply migration script for column type change. | Core Eng | Before GA |
 | R3 | Browser clients cannot store service keys due to enterprise policy. | High | Provide relay service pattern + signed JWT flow; allow read-only mode. | Security + Chrome team | Before Phase 2 |
 | R4 | Hybrid search complexity delays launch. | Medium | Ship dense-only with clear messaging; track hybrid work in separate milestone. | Search Eng | Alpha exit |
 | R5 | Migration from Milvus causes downtime or data loss. | Medium | Provide export/import scripts with dry-run and checksum validation; require backups before migration. | Platform Eng | GA-2 weeks |
 
-## Open Decisions
+## Closed Decisions
 
-1. Confirm whether we require `pg_trgm` for launch or treat lexical search as optional (ties to NC-1).
-2. Decide minimal Supabase tier for “supported” status and document official requirements (NC-2).
-3. Define telemetry/privacy posture for Supabase usage data (who can opt in, granularity).
+- Hybrid search launches dense-only with pg_trgm follow-up (NC-1).
+- Supabase Free tier is the only supported option; failures route to local Postgres fallback (NC-2).
+- Telemetry remains usage-display only; proactive alerts deferred to future milestone (NC-3).
 
 ## Dependencies & External Systems
 
@@ -118,8 +138,15 @@ Indexes:
 
 ## Ready for Planning?
 
-- [ ] Recommended solution (OPT-1) reviewed with stakeholders; trade-offs documented.
-- [ ] Research agenda items assigned with owners/dates.
-- [ ] Gates (simplicity, security, performance) have clear pass criteria.
-- [ ] Risks R1–R5 assigned owners and mitigation plans.
-- [ ] Required interfaces (embedding API, storage schema, client configuration) identified for contracts/data models in planning phase.***
+- [x] Recommended solution (OPT-1) reviewed with stakeholders; trade-offs documented.
+- [x] Research agenda items assigned with owners/dates.
+- [x] Gates (simplicity, security, performance) have clear pass criteria.
+- [x] Risks R1–R5 assigned owners and mitigation plans.
+- [x] Required interfaces (embedding API, storage schema, client configuration) identified for contracts/data models in planning phase.
+
+[^supabase-compute]: Supabase Docs – “Compute and Disk” → _Compute Size_ and _Compute instance_ tables (`https://supabase.com/docs/guides/platform/compute-and-disk`), accessed 2025-03-09.
+[^supabase-free-size]: Supabase Docs – “Understanding Database and Disk Size” → _Free Plan behavior_ (`https://supabase.com/docs/guides/platform/database-size#free-plan-behavior`), accessed 2025-03-09.
+[^supabase-backup]: Supabase Docs – “Going into production” → _Database backup options and limitations_ (`https://supabase.com/docs/guides/platform/going-into-prod#database-backup-options-and-limitations`), accessed 2025-03-09.
+[^supabase-pgvector]: Supabase Docs – “Using the pgvector extension” (`https://supabase.com/docs/guides/database/extensions/pgvector`), accessed 2025-03-09.
+
+***
